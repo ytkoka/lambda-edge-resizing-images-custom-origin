@@ -1,14 +1,23 @@
 'use strict';
 
+const AWS = require('aws-sdk');
 const https = require('https');
 const Sharp = require('sharp');
 const keepAliveAgent = new https.Agent({ keepAlive: true });
+const S3 = new AWS.S3({httpOptions: {agent: keepAliveAgent}});
 
 exports.handler = (event, context, callback) => {
 
   const request = event.Records[0].cf.request;
-  // Read the custom origin name
-  const originname = request.origin.custom.domainName;
+  // Read the S3 origin name
+  const s3DomainName = request.origin.s3.domainName;
+  const BUCKET = s3DomainName.substring(0, s3DomainName.lastIndexOf(".s3"));
+
+  console.log("Bucket:%s", BUCKET);
+  console.log("Image:%s", request.uri);
+
+
+
   var resizingOptions = {};
   const params = new URLSearchParams(request.querystring);
   if (!params.has('width') || !params.has('format')) {
@@ -19,74 +28,44 @@ exports.handler = (event, context, callback) => {
   }
   resizingOptions.width = parseInt(params.get('width'));
 
-  const options = {
-    hostname: originname,
-    port: 443,
-    path: request.uri,
-    method: 'GET',
-    encoding: null,
-    agent: keepAliveAgent
-  }
-  const req = https.request(options, function (res) {
-    console.log(`statusCode: ${res.statusCode}`)
-    console.log(options);
-    console.log(params.get('format'));
-    let chunks = [];
-    res
-      .on('data', (chunk) => {
-        chunks.push(Buffer.from(chunk, 'binary'));
-      })
-      .on('end', () => {
-        // Check the state code is 200 and file extension is jpg
-        if (res.statusCode !== 200 || !request.uri.endsWith('\.jpg')) {
-          req.destroy();
-          callback(null, request);
-          return;
-        }
-        const binary = Buffer.concat(chunks);
-        try {
-          // Generate a response with resized image
-          Sharp(binary)
-            .resize(resizingOptions)
-            .toFormat(params.get('format'))
-            .toBuffer()
-            .then(output => {
-              const base64String = output.toString('base64');
-              console.log("Length of response :%s", base64String.length);
-              if (base64String.length > 1048576) {
-                //Resized filesize payload is greater than 1 MB.Returning original image
-                console.error('Resized filesize payload is greater than 1 MB.Returning original image');
-                callback(null, request);
-                return;
-              }
+  console.log(resizingOptions.width);
 
-              const response = {
-                status: '200',
-                statusDescription: 'OK',
-                headers: {
-                  'cache-control': [{
-                    key: 'Cache-Control',
-                    value: 'max-age=86400'
-                  }],
-                  'content-type': [{
-                    key: 'Content-Type',
-                    value: 'image/' + params.get('format')
-                  }]
-                },
-                bodyEncoding: 'base64',
-                body: base64String
-              };
+  // get the source image from S3
+  S3.getObject({ Bucket: BUCKET, Key: request.uri.substring(1) }).promise()
 
-              callback(null, response);
-            });
-        } catch (err) {
-          // Image resize error
-          console.error(err);
-          callback(null, request);
-        } finally {
-          req.destroy();
-        }
-      });
-  })
-  req.end()
-}
+    .then(data => Sharp(data.Body)
+      .resize(resizingOptions)
+      .toFormat(params.get('format'))
+      .toBuffer()
+    )
+    .then(buffer => {
+      let base64String = buffer.toString('base64');
+      if (base64String.length > 1048576) {
+        throw 'Resized filesize payload is greater than 1 MB. Returning original image'
+      }
+      console.log("Length of response :%s", base64String.length);
+      // generate a binary response with resized image
+      let response = {
+        status: '200',
+        statusDescription: 'OK',
+        headers: {
+          'cache-control': [{
+            key: 'Cache-Control',
+            value: 'max-age=86400'
+          }],
+          'content-type': [{
+            key: 'Content-Type',
+            value: 'image/' + params.get('format')
+          }]
+        },
+        bodyEncoding: 'base64',
+        body: base64String
+      };
+
+      callback(null, response);
+    })
+    .catch(err => {
+      console.log("Exception while reading source image :%j", err);
+      callback(null, request);
+    });
+};
